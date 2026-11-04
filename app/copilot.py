@@ -1,7 +1,11 @@
 import json
-from typing import Any
+from typing import Any, Literal
 
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
 from .config import get_settings
 from .datasources import DataSource, execute_read_query, schema_to_prompt
@@ -10,37 +14,94 @@ from .sql_guard import UnsafeQueryError, validate_and_limit_sql
 from .visuals import materialize_widget
 
 
+class DAGState(TypedDict, total=False):
+    question: str
+    relevance: str
+    sql_query: str
+    query_rows: list[dict]
+    sql_error: str
+    attempts: int
+    answer: "Answer"
+
+
+class Relevance(BaseModel):
+    relevance: Literal["relevant", "not_relevant"]
+
+
+class SQLDraft(BaseModel):
+    sql_query: str = Field(min_length=8, max_length=8_000)
+
+
+class Answer(BaseModel):
+    title: str = Field(min_length=4, max_length=90)
+    message: str = Field(min_length=10, max_length=700)
+
+
+MAX_SQL_REPAIR_ATTEMPTS = 2
+
+
 def build_dashboard(source: DataSource, prompt: str | None = None) -> DashboardResponse:
     settings = get_settings()
-    mode = "openai" if settings.openai_api_key else "heuristic"
-    objective = prompt or "Create an executive overview dashboard for this database."
-    plan = _openai_plan(source, objective) if settings.openai_api_key else _heuristic_plan(source, objective)
-    widgets = []
-    errors = []
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for the LangGraph data-augmented workflow.")
+    question = prompt or "Create an executive overview dashboard for this database."
+    schema_context = schema_to_prompt(source.schema)
 
-    for index, widget_plan in enumerate(plan.widgets):
+    def llm():
+        return ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0)
+
+    def check_relevance(state: DAGState) -> DAGState:
+        result = llm().with_structured_output(Relevance).invoke(
+            f"Determine whether this question can be answered using the database schema. Reply with structured output only.\nSchema:\n{schema_context}\nQuestion: {state['question']}"
+        )
+        return {"relevance": result.relevance}
+
+    def generate_sql(state: DAGState) -> DAGState:
+        result = llm().with_structured_output(SQLDraft).invoke(
+            f"Generate one read-only {source.kind} SELECT or WITH...SELECT statement for the question. Use only this schema. Never generate writes, DDL, multiple statements or explanations.\nSchema:\n{schema_context}\nQuestion: {state['question']}"
+        )
+        return {"sql_query": result.sql_query}
+
+    def execute_sql(state: DAGState) -> DAGState:
         try:
-            safe_sql = validate_and_limit_sql(widget_plan.sql, source.schema, source.kind)
-            data = execute_read_query(source, safe_sql)
-            widgets.append(materialize_widget(widget_plan, data, safe_sql, index))
-        except (UnsafeQueryError, Exception) as exc:
-            errors.append(f"{widget_plan.title}: {exc}")
+            safe_sql = validate_and_limit_sql(state["sql_query"], source.schema, source.kind)
+            return {"sql_query": safe_sql, "query_rows": execute_read_query(source, safe_sql), "sql_error": ""}
+        except Exception as exc:
+            return {"sql_error": str(exc)}
 
-    if not widgets:
-        detail = "; ".join(errors) if errors else "No widgets could be generated"
-        raise ValueError(detail)
+    def repair_sql(state: DAGState) -> DAGState:
+        result = llm().with_structured_output(SQLDraft).invoke(
+            f"Repair this failed read-only SQL. Use only the schema and return one SQL statement. Error: {state['sql_error']}\nSchema:\n{schema_context}\nSQL: {state['sql_query']}"
+        )
+        return {"sql_query": result.sql_query, "attempts": state.get("attempts", 0) + 1}
 
-    insight = _openai_insight(objective, plan, widgets) if settings.openai_api_key else plan.message
-    if errors:
-        insight = f"{insight} Some widgets were skipped: {'; '.join(errors[:2])}"
+    def answer(state: DAGState) -> DAGState:
+        result = llm().with_structured_output(Answer).invoke(
+            f"Write a concise answer in the user's language using only these query rows. Do not invent facts. Question: {state['question']}\nRows: {json.dumps(state.get('query_rows', []), default=str)[:12000]}"
+        )
+        return {"answer": result}
 
-    return DashboardResponse(
-        title=plan.title,
-        message=insight,
-        mode=mode,
-        widgets=widgets,
-        schema=source.schema,
-    )
+    def unrelated(_: DAGState) -> DAGState:
+        return {"answer": Answer(title="Data Augmented BI Copilot", message="Câu hỏi này không liên quan đến dữ liệu trong database đã kết nối.")}
+
+    graph = StateGraph(DAGState)
+    graph.add_node("check_relevance", check_relevance); graph.add_node("generate_sql", generate_sql)
+    graph.add_node("execute_sql", execute_sql); graph.add_node("repair_sql", repair_sql)
+    graph.add_node("generate_answer", answer); graph.add_node("unrelated", unrelated)
+    graph.set_entry_point("check_relevance")
+    graph.add_conditional_edges("check_relevance", lambda state: "generate_sql" if state["relevance"] == "relevant" else "unrelated")
+    graph.add_edge("generate_sql", "execute_sql")
+    graph.add_conditional_edges("execute_sql", lambda state: "generate_answer" if not state.get("sql_error") else ("repair_sql" if state.get("attempts", 0) < MAX_SQL_REPAIR_ATTEMPTS else "unrelated"))
+    graph.add_edge("repair_sql", "execute_sql"); graph.add_edge("generate_answer", END); graph.add_edge("unrelated", END)
+    outcome = graph.compile().invoke({"question": question, "attempts": 0})
+    answer_result = outcome["answer"]
+    rows = outcome.get("query_rows", [])
+    if not rows:
+        return DashboardResponse(title=answer_result.title, message=answer_result.message, mode="openai", widgets=[], schema=source.schema)
+    fields = list(rows[0]); numeric = next((field for field in fields if isinstance(rows[0].get(field), (int, float))), None)
+    chart_type = "kpi" if len(rows) == 1 and len(fields) == 1 else ("bar" if len(fields) >= 2 and numeric else "table")
+    plan = WidgetPlan(title="Query result", description="Generated by LangGraph DAG", chart_type=chart_type, sql=outcome["sql_query"], value_field=fields[0] if chart_type == "kpi" else None, x_field=fields[0] if chart_type == "bar" else None, y_fields=[numeric] if chart_type == "bar" and numeric else [], number_format="compact")
+    return DashboardResponse(title=answer_result.title, message=answer_result.message, mode="openai", widgets=[materialize_widget(plan, rows, outcome["sql_query"], 0)], schema=source.schema)
 
 
 def _openai_plan(source: DataSource, prompt: str) -> DashboardPlan:
